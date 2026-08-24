@@ -12,7 +12,7 @@ use std::sync::Arc;
 use blockchain::{create_ethereum_provider, get_latest_block};
 use config::Config;
 use models::AppState;
-use tokio::time::{Duration, interval};
+use tokio::time::{interval, Duration};
 
 #[tokio::main]
 async fn main() {
@@ -22,11 +22,13 @@ async fn main() {
 
     println!("Connected to PostgreSQL successfully.");
 
-    let ethereum_provider = create_ethereum_provider(&config.ethereum_rpc_url).await;
+    let ethereum_provider =
+        create_ethereum_provider(&config.ethereum_rpc_url).await;
 
     println!("Connected to Ethereum RPC successfully.");
 
     let http_client = reqwest::Client::new();
+
     match blockchain::market::get_prices(&http_client).await {
         Ok(prices) => {
             if let Some(ethereum) = prices.ethereum {
@@ -37,33 +39,91 @@ async fn main() {
                 println!("USDC price: ${}", usdc.usd);
             }
         }
+
         Err(error) => {
             println!("Failed to retrieve market prices: {}", error);
         }
     }
 
-    match blockchain::etherscan::get_transactions(
-        &http_client,
-        &config.etherscan_api_key,
-        "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+    /*
+     * Sync transactions for all wallets currently stored
+     * in the database.
+     */
+    let wallets = match sqlx::query_as::<_, (i64, String)>(
+        r#"
+        SELECT id, address
+        FROM wallets
+        ORDER BY id ASC
+        "#,
     )
+    .fetch_all(&db_pool)
     .await
     {
-        Ok(transactions) => {
-            println!("Etherscan transactions retrieved: {}", transactions.len());
-
-            match blockchain::etherscan::sync_transactions(&db_pool, 1, &transactions).await {
-                Ok(inserted) => {
-                    println!("Transactions inserted into database: {}", inserted);
-                }
-                Err(error) => {
-                    println!("Failed to sync transactions: {}", error);
-                }
-            }
-        }
+        Ok(wallets) => wallets,
 
         Err(error) => {
-            println!("Failed to retrieve Etherscan transactions: {}", error);
+            eprintln!("Failed to retrieve wallets: {}", error);
+            Vec::new()
+        }
+    };
+
+    println!(
+        "Found {} wallet(s) for transaction synchronization.",
+        wallets.len()
+    );
+
+    for (wallet_id, address) in wallets {
+        println!(
+            "Syncing transactions for wallet {} ({})...",
+            wallet_id, address
+        );
+
+        match blockchain::etherscan::get_transactions(
+            &http_client,
+            &config.etherscan_api_key,
+            &address,
+        )
+        .await
+        {
+            Ok(transactions) => {
+                println!(
+                    "Etherscan transactions retrieved for wallet {}: {}",
+                    wallet_id,
+                    transactions.len()
+                );
+
+                match blockchain::etherscan::sync_transactions(
+                    &db_pool,
+                    wallet_id,
+                    &transactions,
+                )
+                .await
+                {
+                    Ok(inserted) => {
+                        println!(
+                            "Transactions inserted for wallet {}: {}",
+                            wallet_id,
+                            inserted
+                        );
+                    }
+
+                    Err(error) => {
+                        eprintln!(
+                            "Failed to sync transactions for wallet {}: {}",
+                            wallet_id,
+                            error
+                        );
+                    }
+                }
+            }
+
+            Err(error) => {
+                eprintln!(
+                    "Failed to retrieve Etherscan transactions for wallet {}: {}",
+                    wallet_id,
+                    error
+                );
+            }
         }
     }
 
@@ -83,6 +143,12 @@ async fn main() {
         http_client,
     };
 
+    /*
+     * Background portfolio snapshot worker.
+     *
+     * Runs every 5 minutes and creates a snapshot
+     * for every wallet stored in the database.
+     */
     let snapshot_state = state.clone();
 
     tokio::spawn(async move {
@@ -93,10 +159,10 @@ async fn main() {
 
             let wallets = match sqlx::query_as::<_, (i64,)>(
                 r#"
-            SELECT id
-            FROM wallets
-            ORDER BY id ASC
-            "#,
+                SELECT id
+                FROM wallets
+                ORDER BY id ASC
+                "#,
             )
             .fetch_all(&snapshot_state.db)
             .await
@@ -104,7 +170,11 @@ async fn main() {
                 Ok(wallets) => wallets,
 
                 Err(error) => {
-                    eprintln!("Failed to retrieve wallets for snapshots: {}", error);
+                    eprintln!(
+                        "Failed to retrieve wallets for snapshots: {}",
+                        error
+                    );
+
                     continue;
                 }
             };
@@ -115,7 +185,12 @@ async fn main() {
             );
 
             for (wallet_id,) in wallets {
-                match handlers::calculate_portfolio_value(&snapshot_state, wallet_id).await {
+                match handlers::calculate_portfolio_value(
+                    &snapshot_state,
+                    wallet_id,
+                )
+                .await
+                {
                     Ok(total_value_usd) => {
                         match handlers::save_portfolio_snapshot(
                             &snapshot_state.db,
@@ -126,15 +201,17 @@ async fn main() {
                         {
                             Ok(_) => {
                                 println!(
-                                    "Portfolio snapshot check completed: wallet_id={}, value=${}",
-                                    wallet_id, total_value_usd
+                                    "Portfolio snapshot completed: wallet_id={}, value=${}",
+                                    wallet_id,
+                                    total_value_usd
                                 );
                             }
 
                             Err(error) => {
                                 eprintln!(
                                     "Failed to save snapshot for wallet {}: {}",
-                                    wallet_id, error
+                                    wallet_id,
+                                    error
                                 );
                             }
                         }
@@ -143,7 +220,8 @@ async fn main() {
                     Err(error) => {
                         eprintln!(
                             "Failed to calculate portfolio for wallet {}: {}",
-                            wallet_id, error
+                            wallet_id,
+                            error
                         );
                     }
                 }
@@ -153,13 +231,22 @@ async fn main() {
 
     let app = routes::create_router(state);
 
-    let address = format!("{}:{}", config.server_host, config.server_port);
+    let address = format!(
+        "{}:{}",
+        config.server_host,
+        config.server_port
+    );
 
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .expect("Failed to bind server");
 
-    println!("ChainPulse API running on http://{}", address);
+    println!(
+        "ChainPulse API running on http://{}",
+        address
+    );
 
-    axum::serve(listener, app).await.expect("Server failed");
+    axum::serve(listener, app)
+        .await
+        .expect("Server failed");
 }
