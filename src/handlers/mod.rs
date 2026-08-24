@@ -931,7 +931,7 @@ where
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let prices = crate::blockchain::market::get_prices(&state.http_client)
+    let prices = crate::blockchain::market::get_prices_with_cache(&state.http_client, &state.db)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 

@@ -1,7 +1,7 @@
 /target
-.env
 
-.env.*
 !.env.example
 
 target/
+config.bat
+node_modules
